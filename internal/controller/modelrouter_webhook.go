@@ -62,7 +62,7 @@ func SetupModelRouterWebhookWithManager(mgr ctrl.Manager) error {
 // ValidateCreate validates a ModelRouter on creation.
 func (v *ModelRouterValidator) ValidateCreate(ctx context.Context, mr *inferencev1alpha1.ModelRouter) (admission.Warnings, error) {
 	logf.FromContext(ctx).V(1).Info("validating ModelRouter create", "name", mr.Name, "namespace", mr.Namespace)
-	return nil, v.validate(mr)
+	return aliasNameCollisionWarnings(mr), v.validate(mr)
 }
 
 // ValidateUpdate validates a ModelRouter on update. We grandfather updates that
@@ -79,7 +79,7 @@ func (v *ModelRouterValidator) ValidateUpdate(ctx context.Context, oldMR, mr *in
 		return nil, nil
 	}
 	log.Info("validating ModelRouter update", "name", mr.Name, "namespace", mr.Namespace)
-	return nil, v.validate(mr)
+	return aliasNameCollisionWarnings(mr), v.validate(mr)
 }
 
 // ValidateDelete is a no-op: deleting a ModelRouter is always allowed (owner-ref

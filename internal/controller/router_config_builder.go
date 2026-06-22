@@ -67,6 +67,7 @@ func (r *ModelRouterReconciler) compileRouterConfig(
 		DefaultRoute: mr.Spec.DefaultRoute,
 		Backends:     make([]router.Backend, 0, len(mr.Spec.Backends)),
 		Rules:        make([]router.Rule, 0, len(mr.Spec.Rules)),
+		Aliases:      make([]router.Alias, 0, len(mr.Spec.Aliases)),
 	}
 	statuses := make([]inferencev1alpha1.BackendStatus, 0, len(mr.Spec.Backends))
 	var warnings []string
@@ -83,6 +84,9 @@ func (r *ModelRouterReconciler) compileRouterConfig(
 
 	for i := range mr.Spec.Rules {
 		out.Rules = append(out.Rules, translateRule(&mr.Spec.Rules[i]))
+	}
+	for i := range mr.Spec.Aliases {
+		out.Aliases = append(out.Aliases, translateAlias(&mr.Spec.Aliases[i]))
 	}
 	out.Policy = translatePolicy(mr.Spec.Policy)
 
@@ -294,6 +298,18 @@ func translateRule(in *inferencev1alpha1.RouterRule) router.Rule {
 			Headers:              copyStringMap(in.Match.Headers),
 			Models:               append([]string(nil), in.Match.Models...),
 		}
+	}
+	if in.Timeout != nil {
+		out.Timeout = in.Timeout.Duration
+	}
+	return out
+}
+
+// translateAlias maps a ModelRouter spec alias to the proxy wire shape.
+func translateAlias(in *inferencev1alpha1.RouterAlias) router.Alias {
+	out := router.Alias{
+		Name:     in.Name,
+		Backends: append([]string(nil), in.Backends...),
 	}
 	if in.Timeout != nil {
 		out.Timeout = in.Timeout.Duration

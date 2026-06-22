@@ -184,6 +184,62 @@ func TestValidateModelRouterRuleEmptyBackends(t *testing.T) {
 	}
 }
 
+func TestValidateModelRouterAliases(t *testing.T) {
+	cases := []struct {
+		name       string
+		aliases    []inferencev1alpha1.RouterAlias
+		wantErrSub string // empty -> expect no error
+	}{
+		{
+			name:    "valid alias",
+			aliases: []inferencev1alpha1.RouterAlias{{Name: "fast", Backends: []string{testRouterLocalBackend}}},
+		},
+		{
+			name:       "no backends",
+			aliases:    []inferencev1alpha1.RouterAlias{{Name: "fast"}},
+			wantErrSub: "must reference at least one backend",
+		},
+		{
+			name:       "undefined backend",
+			aliases:    []inferencev1alpha1.RouterAlias{{Name: "fast", Backends: []string{"ghost"}}},
+			wantErrSub: `references undefined backend "ghost"`,
+		},
+		{
+			name: "duplicate name",
+			aliases: []inferencev1alpha1.RouterAlias{
+				{Name: "fast", Backends: []string{testRouterLocalBackend}},
+				{Name: "fast", Backends: []string{testRouterLocalBackend}},
+			},
+			wantErrSub: `duplicate alias name "fast"`,
+		},
+		{
+			name: "timeout too long",
+			aliases: []inferencev1alpha1.RouterAlias{{
+				Name:     "fast",
+				Backends: []string{testRouterLocalBackend},
+				Timeout:  &metav1.Duration{Duration: time.Hour},
+			}},
+			wantErrSub: "probable unit typo",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mr := validRouter()
+			mr.Spec.Aliases = tc.aliases
+			errs := validateModelRouter(mr)
+			if tc.wantErrSub == "" {
+				if len(errs) != 0 {
+					t.Fatalf("expected no error, got: %s", formatValidationErrors(errs))
+				}
+				return
+			}
+			if !errsContain(errs, tc.wantErrSub) {
+				t.Errorf("want %q; got: %s", tc.wantErrSub, formatValidationErrors(errs))
+			}
+		})
+	}
+}
+
 // TestValidateModelRouterSensitiveDataRequiresFailClosed is the headline
 // gate: any rule matching pii/phi must have failClosed=true.
 func TestValidateModelRouterSensitiveDataRequiresFailClosed(t *testing.T) {

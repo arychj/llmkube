@@ -15,6 +15,8 @@ import (
 	"strings"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
 
@@ -74,9 +76,117 @@ func validateModelRouter(mr *inferencev1alpha1.ModelRouter) []ModelRouterValidat
 
 	ruleNames, ruleErrs := validateRules(spec, nameSet, backendsByName)
 	errs = append(errs, ruleErrs...)
+	errs = append(errs, validateAliases(spec, nameSet)...)
 	errs = append(errs, validateBudgets(spec, ruleNames)...)
 
 	return errs
+}
+
+// validateAliases checks each RouterAlias for unique names, backends that
+// reference declared backends, and timeout bounds.
+func validateAliases(
+	spec *inferencev1alpha1.ModelRouterSpec,
+	nameSet map[string]bool,
+) []ModelRouterValidationError {
+	var errs []ModelRouterValidationError
+	seen := make(map[string]bool, len(spec.Aliases))
+	for i := range spec.Aliases {
+		a := &spec.Aliases[i]
+		path := fmt.Sprintf("spec.aliases[%d]", i)
+
+		switch {
+		case a.Name == "":
+			errs = append(errs, ModelRouterValidationError{
+				Field:   path + ".name",
+				Message: "name is required",
+			})
+		case seen[a.Name]:
+			errs = append(errs, ModelRouterValidationError{
+				Field:   path + ".name",
+				Message: fmt.Sprintf("duplicate alias name %q", a.Name),
+			})
+		default:
+			// Only track real names so a second empty name reports
+			// "name is required" again, not a spurious duplicate-of-"".
+			seen[a.Name] = true
+		}
+
+		if len(a.Backends) == 0 {
+			errs = append(errs, ModelRouterValidationError{
+				Field:   path + ".backends",
+				Message: "must reference at least one backend",
+			})
+		}
+		for j, name := range a.Backends {
+			if !nameSet[name] {
+				errs = append(errs, ModelRouterValidationError{
+					Field:   fmt.Sprintf("%s.backends[%d]", path, j),
+					Message: fmt.Sprintf("references undefined backend %q", name),
+				})
+			}
+		}
+		errs = append(errs, validateTimeoutBounds(a.Timeout, path+".timeout")...)
+	}
+	return errs
+}
+
+// aliasNameCollisionWarnings reports alias names that shadow a backend's
+// /v1/models id. This is not an error — an alias may intentionally reuse an
+// id — but the discovery entries collapse into one, dropping the alias's
+// entry silently, so surface it as an apply-time warning. The published id is
+// the backend's external Model when set, otherwise its Name (mirroring the
+// proxy's handleModels), so an alias named after a cloud model id (e.g.
+// "gpt-4o", where the backend Name is "openai-primary") collides too — that
+// is the most likely collision in practice, and a Name-only check would miss
+// it. Rule-name overlaps are not warned: the audit log distinguishes alias
+// from rule routes, so a shared name there is unambiguous at runtime.
+func aliasNameCollisionWarnings(mr *inferencev1alpha1.ModelRouter) []string {
+	spec := &mr.Spec
+	publishedIDs := make(map[string]bool, len(spec.Backends))
+	for i := range spec.Backends {
+		b := &spec.Backends[i]
+		id := b.Name
+		if b.External != nil && b.External.Model != "" {
+			id = b.External.Model
+		}
+		publishedIDs[id] = true
+	}
+	var warnings []string
+	for i := range spec.Aliases {
+		name := spec.Aliases[i].Name
+		if publishedIDs[name] {
+			warnings = append(warnings, fmt.Sprintf(
+				"alias %q shares its /v1/models id with a backend; they collapse to a single entry",
+				name))
+		}
+	}
+	return warnings
+}
+
+// validateTimeoutBounds enforces sane bounds shared by rule, backend, and
+// alias timeouts. Too short (<100ms) is almost certainly a config error:
+// even local llama-server can't first-token in under that. Too long (>30m)
+// is a smell for any LLM request and is more likely a unit typo (eg "30s"
+// intended as "30m") than a legitimate ask. path is the full dotted field
+// locator (already including ".timeout").
+func validateTimeoutBounds(timeout *metav1.Duration, path string) []ModelRouterValidationError {
+	if timeout == nil {
+		return nil
+	}
+	d := timeout.Duration
+	if d < minRouterTimeout {
+		return []ModelRouterValidationError{{
+			Field:   path,
+			Message: fmt.Sprintf("must be >= %s; got %s", minRouterTimeout, d),
+		}}
+	}
+	if d > maxRouterTimeout {
+		return []ModelRouterValidationError{{
+			Field:   path,
+			Message: fmt.Sprintf("must be <= %s; got %s (probable unit typo)", maxRouterTimeout, d),
+		}}
+	}
+	return nil
 }
 
 // validateBackends checks each RouterBackend in spec.backends and returns
@@ -119,36 +229,9 @@ func validateBackends(spec *inferencev1alpha1.ModelRouterSpec) (
 		nameSet[b.Name] = true
 		byName[b.Name] = b
 
-		errs = append(errs, validateBackendTimeout(b, path)...)
+		errs = append(errs, validateTimeoutBounds(b.Timeout, path+".timeout")...)
 	}
 	return nameSet, byName, errs
-}
-
-// validateBackendTimeout enforces the same sane bounds as rule.timeout
-// (see validateRuleTimeout). Backend-level timeouts override the proxy
-// default but are themselves overridden by rule-level timeouts at
-// dispatch time.
-func validateBackendTimeout(
-	b *inferencev1alpha1.RouterBackend,
-	path string,
-) []ModelRouterValidationError {
-	if b.Timeout == nil {
-		return nil
-	}
-	d := b.Timeout.Duration
-	if d < minRouterTimeout {
-		return []ModelRouterValidationError{{
-			Field:   path + ".timeout",
-			Message: fmt.Sprintf("must be >= %s; got %s", minRouterTimeout, d),
-		}}
-	}
-	if d > maxRouterTimeout {
-		return []ModelRouterValidationError{{
-			Field:   path + ".timeout",
-			Message: fmt.Sprintf("must be <= %s; got %s (probable unit typo)", maxRouterTimeout, d),
-		}}
-	}
-	return nil
 }
 
 // validateBackendKindExclusivity enforces exactly-one-of(inferenceServiceRef,
@@ -191,37 +274,9 @@ func validateRules(
 		}
 		errs = append(errs, validateRuleRoute(rule, path, nameSet)...)
 		errs = append(errs, validateRuleSensitiveData(rule, path, sensitiveSet, byName)...)
-		errs = append(errs, validateRuleTimeout(rule, path)...)
+		errs = append(errs, validateTimeoutBounds(rule.Timeout, path+".timeout")...)
 	}
 	return ruleNames, errs
-}
-
-// validateRuleTimeout enforces sane bounds on rule.timeout. Too short
-// (<100ms) is almost certainly a config error: even local llama-server
-// can't first-token in under that. Too long (>30m) is a smell for any
-// LLM request and is more likely a unit typo (eg "30s" intended as
-// "30m") than a legitimate ask.
-func validateRuleTimeout(
-	rule *inferencev1alpha1.RouterRule,
-	path string,
-) []ModelRouterValidationError {
-	if rule.Timeout == nil {
-		return nil
-	}
-	d := rule.Timeout.Duration
-	if d < minRouterTimeout {
-		return []ModelRouterValidationError{{
-			Field:   path + ".timeout",
-			Message: fmt.Sprintf("must be >= %s; got %s", minRouterTimeout, d),
-		}}
-	}
-	if d > maxRouterTimeout {
-		return []ModelRouterValidationError{{
-			Field:   path + ".timeout",
-			Message: fmt.Sprintf("must be <= %s; got %s (probable unit typo)", maxRouterTimeout, d),
-		}}
-	}
-	return nil
 }
 
 // validateRuleRoute checks that rule.route.backends references real backends.

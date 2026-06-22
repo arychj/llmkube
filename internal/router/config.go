@@ -41,7 +41,11 @@ type Config struct {
 	// rule whose Match expression accepts the request wins.
 	Rules []Rule `json:"rules,omitempty"`
 
-	// DefaultRoute names the backend used when no rule matches.
+	// Aliases are exact-model-name routes consulted after Rules and before
+	// DefaultRoute; each also surfaces its Name in /v1/models.
+	Aliases []Alias `json:"aliases,omitempty"`
+
+	// DefaultRoute names the backend used when no rule or alias matches.
 	DefaultRoute string `json:"defaultRoute,omitempty"`
 
 	// Policy holds cross-cutting controls (classification, audit). Budget
@@ -113,6 +117,15 @@ type Rule struct {
 	// default) so platform policy (eg PII fail-fast) can't be defeated
 	// by a generous backend-level timeout.
 	Timeout time.Duration `json:"timeout,omitempty"`
+}
+
+// Alias is an exact-model-name route that also publishes its Name in
+// /v1/models. The matcher compiles each into a synthetic primary-fallback
+// rule, so a matched alias reuses the rule dispatch path.
+type Alias struct {
+	Name     string        `json:"name"`
+	Backends []string      `json:"backends"`
+	Timeout  time.Duration `json:"timeout,omitempty"`
 }
 
 // RuleMatch declares the conditions under which a Rule fires. All declared
@@ -229,6 +242,25 @@ func (c *Config) Validate() error {
 			if !names[name] {
 				return fmt.Errorf("rules[%d] %s: route.backends[%d] %q does not name an existing backend",
 					i, r.Name, j, name)
+			}
+		}
+	}
+	aliasNames := make(map[string]bool, len(c.Aliases))
+	for i, a := range c.Aliases {
+		if a.Name == "" {
+			return fmt.Errorf("aliases[%d]: name is required", i)
+		}
+		if aliasNames[a.Name] {
+			return fmt.Errorf("aliases[%d]: duplicate name %q", i, a.Name)
+		}
+		aliasNames[a.Name] = true
+		if len(a.Backends) == 0 {
+			return fmt.Errorf("aliases[%d] %s: backends must be non-empty", i, a.Name)
+		}
+		for j, name := range a.Backends {
+			if !names[name] {
+				return fmt.Errorf("aliases[%d] %s: backends[%d] %q does not name an existing backend",
+					i, a.Name, j, name)
 			}
 		}
 	}

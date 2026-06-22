@@ -84,9 +84,9 @@ func (p *Proxy) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
 
-// handleModels returns an OpenAI-compatible /v1/models payload listing
-// every backend in the config. Cloud backends report their upstream
-// Model field; local backends report their backend name.
+// handleModels returns an OpenAI-compatible /v1/models payload: every
+// backend (cloud backends report their upstream Model, local backends their
+// name) plus every alias Name, de-duplicated by id.
 func (p *Proxy) handleModels(w http.ResponseWriter, _ *http.Request) {
 	type model struct {
 		ID      string `json:"id"`
@@ -95,7 +95,15 @@ func (p *Proxy) handleModels(w http.ResponseWriter, _ *http.Request) {
 		OwnedBy string `json:"owned_by"`
 	}
 	now := time.Now().Unix()
-	models := make([]model, 0, len(p.cfg.Backends))
+	models := make([]model, 0, len(p.cfg.Backends)+len(p.cfg.Aliases))
+	seen := make(map[string]bool, len(p.cfg.Backends)+len(p.cfg.Aliases))
+	add := func(id, owned string) {
+		if id == "" || seen[id] {
+			return
+		}
+		seen[id] = true
+		models = append(models, model{ID: id, Object: "model", Created: now, OwnedBy: owned})
+	}
 	for _, b := range p.cfg.Backends {
 		id := b.Name
 		if b.Model != "" {
@@ -105,7 +113,10 @@ func (p *Proxy) handleModels(w http.ResponseWriter, _ *http.Request) {
 		if b.Provider != "" {
 			owned = b.Provider
 		}
-		models = append(models, model{ID: id, Object: "model", Created: now, OwnedBy: owned})
+		add(id, owned)
+	}
+	for _, a := range p.cfg.Aliases {
+		add(a.Name, "llmkube")
 	}
 	body, _ := json.Marshal(map[string]any{"object": "list", "data": models})
 	w.Header().Set("Content-Type", "application/json")
@@ -372,7 +383,13 @@ func (p *Proxy) audit(
 		"latencyMs", elapsed.Milliseconds(),
 	}
 	if dec.Rule != nil {
-		attrs = append(attrs, "rule", dec.Rule.Name)
+		// An alias compiles to a synthetic rule; label it distinctly so
+		// the audit trail can tell an alias route from a declared rule.
+		key := "rule"
+		if dec.IsAlias {
+			key = "alias"
+		}
+		attrs = append(attrs, key, dec.Rule.Name)
 	}
 	if chosen != nil {
 		attrs = append(attrs, "backend", chosen.Name, "backendTier", chosen.Tier)

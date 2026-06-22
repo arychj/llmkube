@@ -196,6 +196,136 @@ func TestProxyModels(t *testing.T) {
 	}
 }
 
+// TestProxyModelsPublishesAliases verifies that alias names surface in
+// /v1/models alongside backends, and that an alias whose name collides with
+// a backend id de-duplicates to a single entry.
+func TestProxyModelsPublishesAliases(t *testing.T) {
+	local := newFakeBackend(t)
+	cfg := &Config{
+		Backends: []Backend{
+			{Name: "gemma-4-e4b", Tier: "local", Address: local.URL()},
+		},
+		Aliases: []Alias{
+			{Name: "fast", Backends: []string{"gemma-4-e4b"}},
+			{Name: "think", Backends: []string{"gemma-4-e4b"}},
+			// Collides with the backend id; must not double-publish.
+			{Name: "gemma-4-e4b", Backends: []string{"gemma-4-e4b"}},
+		},
+		DefaultRoute: "gemma-4-e4b",
+		Policy:       Policy{Classification: ClassificationPolicy{Mode: "header-only"}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	mux := http.NewServeMux()
+	NewProxy(cfg, slog.Default()).Mount(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/v1/models = %d, want 200", rec.Code)
+	}
+	var got struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	ids := make(map[string]int)
+	for _, m := range got.Data {
+		ids[m.ID]++
+	}
+	for _, want := range []string{"gemma-4-e4b", "fast", "think"} {
+		if ids[want] != 1 {
+			t.Errorf("model %q count = %d, want 1; full list: %v", want, ids[want], ids)
+		}
+	}
+	// Exactly three distinct ids: the backend plus two non-colliding
+	// aliases. Pins the dedup (the gemma-4-e4b alias collapses) and guards
+	// against any phantom entry leaking in.
+	if len(got.Data) != 3 {
+		t.Errorf("expected 3 models, got %d: %v", len(got.Data), ids)
+	}
+}
+
+// aliasDispatchPost builds a proxy from cfg, POSTs the given model, and
+// returns the recorder. Non-streaming, so httptest.NewRecorder suffices.
+func aliasDispatchPost(t *testing.T, cfg *Config, model string) *httptest.ResponseRecorder {
+	t.Helper()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	mux := http.NewServeMux()
+	NewProxy(cfg, slog.Default()).Mount(mux)
+	body, _ := json.Marshal(map[string]any{"model": model})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestProxyDispatchesViaAlias is the end-to-end check that a request naming
+// an alias actually dispatches through the synthetic alias rule to its
+// backend — the one place the alias-as-rule abstraction could leak. The
+// default route points at a DIFFERENT backend so that if alias matching
+// broke, the request would fall through to the default and the assertions
+// would catch it (rather than silently hitting the same backend).
+func TestProxyDispatchesViaAlias(t *testing.T) {
+	aliasBackend := newFakeBackend(t)
+	defaultBackend := newFakeBackend(t)
+	cfg := &Config{
+		Backends: []Backend{
+			{Name: "b-alias", Tier: "local", Address: aliasBackend.URL()},
+			{Name: "b-default", Tier: "local", Address: defaultBackend.URL()},
+		},
+		Aliases:      []Alias{{Name: "fast", Backends: []string{"b-alias"}}},
+		DefaultRoute: "b-default",
+		Policy:       Policy{Classification: ClassificationPolicy{Mode: "header-only"}},
+	}
+	rec := aliasDispatchPost(t, cfg, "fast")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if aliasBackend.calls.Load() != 1 {
+		t.Errorf("alias backend calls = %d, want 1", aliasBackend.calls.Load())
+	}
+	if defaultBackend.calls.Load() != 0 {
+		t.Errorf("default backend must not be hit when the alias matches; calls = %d", defaultBackend.calls.Load())
+	}
+}
+
+// TestProxyAliasOrderedFallback exercises an alias's ordered backend list:
+// the primary 5xxs and the request must fall over to the secondary. This is
+// the alias's reason to exist (local-first, cloud-fallback degradation).
+func TestProxyAliasOrderedFallback(t *testing.T) {
+	primary := newFakeBackend(t)
+	secondary := newFakeBackend(t)
+	primary.status.Store(500)
+	cfg := &Config{
+		Backends: []Backend{
+			{Name: "b1", Tier: "local", Address: primary.URL()},
+			{Name: "b2", Tier: "local", Address: secondary.URL()},
+		},
+		Aliases:      []Alias{{Name: "frontier", Backends: []string{"b1", "b2"}}},
+		DefaultRoute: "b1",
+		Policy:       Policy{Classification: ClassificationPolicy{Mode: "header-only"}},
+	}
+	rec := aliasDispatchPost(t, cfg, "frontier")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (fallback to secondary)", rec.Code)
+	}
+	if primary.calls.Load() != 1 {
+		t.Errorf("primary should be tried once, calls = %d", primary.calls.Load())
+	}
+	if secondary.calls.Load() != 1 {
+		t.Errorf("secondary should serve as fallback, calls = %d", secondary.calls.Load())
+	}
+}
+
 func TestProxyRoutesPIIToLocal(t *testing.T) {
 	h := newProxyHarness(t)
 	resp := h.post(t, map[string]any{"model": "any"}, map[string]string{
@@ -427,6 +557,23 @@ func TestResolveDispatchTimeoutHandlesNilDecisionOrBackend(t *testing.T) {
 	}
 	if got := resolveDispatchTimeout(nil, nil, want); got != want {
 		t.Errorf("both nil: got %v, want %v", got, want)
+	}
+}
+
+// TestResolveDispatchTimeoutAppliesAliasTimeout proves the alias timeout
+// reaches dispatch: it flows alias.Timeout -> synthetic rule -> the decision
+// resolveDispatchTimeout reads. Driven through the real matcher so it covers
+// the whole wiring, not a hand-built decision. Without this, the alias-as-rule
+// abstraction is proven only at match time, not at dispatch time.
+func TestResolveDispatchTimeoutAppliesAliasTimeout(t *testing.T) {
+	cfg := validConfig()
+	cfg.Aliases = []Alias{{Name: "fast", Backends: []string{"local-qwen"}, Timeout: 7 * time.Second}}
+	m := NewMatcher(cfg)
+	dec := m.Match(&RequestFeatures{Model: "fast"})
+	// Backend carries no timeout and the proxy default is large, so the alias
+	// timeout is the only thing that can produce 7s.
+	if got := resolveDispatchTimeout(&dec, m.BackendByName("local-qwen"), 99*time.Second); got != 7*time.Second {
+		t.Errorf("alias timeout not applied at dispatch: got %v, want 7s", got)
 	}
 }
 

@@ -77,10 +77,26 @@ type ModelRouterSpec struct {
 	Backends []RouterBackend `json:"backends"`
 
 	// Rules are evaluated in declaration order. The first matching rule wins.
-	// If no rule matches, DefaultRoute is used. If neither a matching rule
-	// nor DefaultRoute is set, the request is rejected with HTTP 503.
+	// If no rule matches, Aliases are consulted, then DefaultRoute. If none
+	// of the three match, the request is rejected with HTTP 503.
 	// +optional
 	Rules []RouterRule `json:"rules,omitempty"`
+
+	// Aliases are named, published routing shortcuts: a stable model id a
+	// client can request directly. An alias advertises its Name in the
+	// OpenAI-compatible /v1/models discovery list and routes a request
+	// whose "model" field equals that Name to its ordered backend list
+	// (primary-fallback). Use one to publish a stable tier — "fast",
+	// "balanced", "frontier" — that abstracts the underlying model: clients
+	// commit to the tier name while the operator repoints it at a different
+	// or better backend without any client changing the model it sends.
+	//
+	// Consulted after Rules and before DefaultRoute. Rules win: a security
+	// rail (e.g. a fail-closed pii rule that matches on classification
+	// regardless of model name) always intercepts before an alias can route
+	// the request, including to a cloud backend.
+	// +optional
+	Aliases []RouterAlias `json:"aliases,omitempty"`
 
 	// DefaultRoute names a backend used when no rule matches.
 	// Must reference the Name of an entry in Backends.
@@ -259,6 +275,37 @@ type RouterRule struct {
 	// rule.timeout || backend.timeout || proxy default.
 	// Useful for tightening regulated-data rules (sub-10s strict
 	// fail-fast) or extending long-reasoning rules (120s+).
+	// +optional
+	Timeout *metav1.Duration `json:"timeout,omitempty"`
+}
+
+// RouterAlias is a named, published routing shortcut: a stable model id a
+// client requests directly. It is the slimmed-down sibling of RouterRule —
+// no match expression (the Name is the match), no fail-closed gate, and
+// primary-fallback implied by the ordered backend list. Reach for an alias
+// to surface a stable tier or model name in /v1/models and bind it to
+// concrete backends; reach for a Rule when routing must depend on
+// classification, capability, or headers.
+type RouterAlias struct {
+	// Name is the model id. It is published verbatim in the /v1/models
+	// discovery list, and a request whose "model" field equals this Name
+	// routes to Backends. Must be lowercase alphanumeric or '-'. Unique
+	// across aliases.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]{0,62}$`
+	Name string `json:"name"`
+
+	// Backends is an ordered list of RouterBackend.Name values tried
+	// left-to-right (primary-fallback): the first entry serves every
+	// request until it fails, then the next takes over. Same semantics as
+	// a rule's route.backends. Must reference declared backends.
+	// +kubebuilder:validation:MinItems=1
+	Backends []string `json:"backends"`
+
+	// Timeout caps how long the proxy waits for the upstream to begin
+	// sending response headers on dispatches routed by this alias. When set
+	// it overrides the matched backend's timeout and the proxy default
+	// (resolution order: alias.timeout || backend.timeout || proxy
+	// default), the same precedence a rule's timeout has.
 	// +optional
 	Timeout *metav1.Duration `json:"timeout,omitempty"`
 }

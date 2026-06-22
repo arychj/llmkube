@@ -232,6 +232,56 @@ func TestModelRouterValidator_ProxyModeStillRunsStaticChecks(t *testing.T) {
 	}
 }
 
+// TestModelRouterValidator_AliasBackendCollisionWarns proves an alias whose
+// name shadows a backend's /v1/models id is accepted (no error) but surfaces
+// an apply-time warning, that the collision is detected against the published
+// id (external Model, not just Name), and that a non-colliding alias warns
+// nothing.
+func TestModelRouterValidator_AliasBackendCollisionWarns(t *testing.T) {
+	v := &ModelRouterValidator{}
+	ctx := context.Background()
+
+	// A cloud backend publishes under its external Model ("gpt-4o"), not its
+	// Name ("openai-primary"): an alias named after the model id must warn.
+	withCloud := func() *inferencev1alpha1.ModelRouter {
+		mr := validGatewayRouter()
+		mr.Spec.Backends = append(mr.Spec.Backends, inferencev1alpha1.RouterBackend{
+			Name: "openai-primary",
+			External: &inferencev1alpha1.ExternalProvider{
+				Provider: "openai",
+				Model:    "gpt-4o",
+			},
+			Tier: testRouterTierCloud,
+		})
+		return mr
+	}
+
+	cases := []struct {
+		name      string
+		alias     string
+		wantWarns int
+	}{
+		{name: "collides with backend Name", alias: "qwen-cuda", wantWarns: 1},
+		{name: "collides with backend Model id", alias: "gpt-4o", wantWarns: 1},
+		{name: "no collision", alias: "fast", wantWarns: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mr := withCloud()
+			mr.Spec.Aliases = []inferencev1alpha1.RouterAlias{
+				{Name: tc.alias, Backends: []string{"qwen-cuda"}},
+			}
+			warnings, err := v.ValidateCreate(ctx, mr)
+			if err != nil {
+				t.Fatalf("collision is a warning, not an error; got %v", err)
+			}
+			if len(warnings) != tc.wantWarns {
+				t.Errorf("expected %d warning(s), got %d: %v", tc.wantWarns, len(warnings), warnings)
+			}
+		})
+	}
+}
+
 // TestModelRouterValidator_Update reuses the create branches when the spec
 // changes: a spec-changing update applies the same invariants.
 func TestModelRouterValidator_Update(t *testing.T) {

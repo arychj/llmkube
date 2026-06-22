@@ -597,6 +597,48 @@ func TestCompileRouterConfigCopiesBackendTimeout(t *testing.T) {
 	}
 }
 
+// TestCompileRouterConfigCompilesAliases pins that spec.aliases flow
+// through translateAlias into the wire-shape Config.Aliases, name,
+// ordered backends, and timeout intact.
+func TestCompileRouterConfigCompilesAliases(t *testing.T) {
+	mr := canonicalModelRouter()
+	mr.Spec.Aliases = []inferencev1alpha1.RouterAlias{{
+		Name:     "fast",
+		Backends: []string{"local-qwen", "cloud-opus"},
+		Timeout:  &metav1.Duration{Duration: 9 * time.Second},
+	}}
+
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "qwen3-coder", Namespace: testBuilderNs},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "anthropic-key", Namespace: testBuilderNs},
+		Data:       map[string][]byte{"ANTHROPIC_API_KEY": []byte("test")},
+	}
+	r := newRouterReconcilerForTest(t, mr, isvc, secret)
+	compiled, err := r.compileRouterConfig(context.Background(), mr)
+	if err != nil {
+		t.Fatalf("compileRouterConfig: %v", err)
+	}
+	var cfg router.Config
+	if err := json.Unmarshal(compiled.JSON, &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(cfg.Aliases) != 1 {
+		t.Fatalf("aliases = %d, want 1", len(cfg.Aliases))
+	}
+	a := cfg.Aliases[0]
+	if a.Name != "fast" {
+		t.Errorf("alias name = %q, want fast", a.Name)
+	}
+	if len(a.Backends) != 2 || a.Backends[0] != "local-qwen" || a.Backends[1] != "cloud-opus" {
+		t.Errorf("alias backends = %v, want ordered [local-qwen cloud-opus]", a.Backends)
+	}
+	if a.Timeout != 9*time.Second {
+		t.Errorf("alias timeout = %v, want 9s", a.Timeout)
+	}
+}
+
 // TestRouterServiceBuilder confirms ClusterIP default and the
 // canonical selector label.
 func TestRouterServiceBuilder(t *testing.T) {

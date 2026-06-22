@@ -177,6 +177,46 @@ The router-proxy forwards the inbound OpenAI chat-completion request body to ups
 
 When you specify `provider: anthropic` or `provider: openai` without `url`, the controller fills in the published default (`https://api.anthropic.com`, `https://api.openai.com`). This works as-is for OpenAI (which already speaks the OpenAI shape) and for any Anthropic-compatible endpoint that accepts OpenAI requests. Direct calls against `api.anthropic.com` itself require LiteLLM in front; native Anthropic-Messages translation is on the roadmap, not in Phase 1.
 
+## Aliases and model discovery (`/v1/models`)
+
+The router-proxy serves an OpenAI-compatible `GET /v1/models` list — the dropdown OpenWebUI and most clients populate from. Every declared backend appears in it: a cloud backend reports its upstream `model`, a local backend reports its backend name.
+
+An **alias** is a named, published routing shortcut, declared at the top level alongside `backends` and `rules`. It is the slimmed-down sibling of a rule — just a name, an ordered backend list, and an optional timeout. An alias publishes a stable model *tier* and binds it to concrete backends, so clients commit to the tier name (`fast`, `balanced`, `frontier`) while the operator decides which model actually serves it — and can repoint that tier to a different or better model later without any client changing the `model` it sends. The `name` is advertised verbatim in `/v1/models` and is the exact string a client sends in the request `model` field to route there; the `backends` are tried left-to-right (primary-fallback), the same semantics as a rule's `route.backends`.
+
+```yaml
+spec:
+  backends:
+    - name: small-local
+      inferenceServiceRef: { name: small-local-inference-service }
+    - name: large-local
+      inferenceServiceRef: { name: large-local-inference-service }
+    # ...plus a cloud-fallback backend declared elsewhere in backends
+  aliases:
+    - name: fast               # surfaces in /v1/models; routes "model: fast"
+      backends: [small-local]
+    - name: balanced
+      backends: [large-local]
+      timeout: 60s
+    - name: frontier           # ordered fallback: local first, then cloud
+      backends: [large-local, cloud-fallback]
+      timeout: 20s
+```
+
+A client that selects `frontier` never learns which model answered; the operator can swap `large-local` for a newer checkpoint, or reorder the fallback chain, and the published tier name stays put.
+
+A few things to know:
+
+- **Precedence is rules → aliases → `defaultRoute`.** Rules are evaluated first, so a security rail (e.g. a fail-closed `pii` rule that matches on classification regardless of model name) always intercepts before an alias can route the request — including to a cloud backend. An alias never bypasses a matching rule. This is why the `frontier` alias above can safely list a cloud fallback: a `pii`-classified request to `model: frontier` still hits the fail-closed rule first and stays local.
+- **Aliases match on exact name, rules match on globs.** A request `model` is compared verbatim against alias names; rule `match.models` still supports glob patterns. If a rule glob and an alias name overlap, the rule wins (it is checked first).
+- **The list is de-duplicated by id.** A backend and an alias advertising the same name collapse to a single `/v1/models` entry.
+- **Backends are still always listed.** Aliases are additive discovery, not a replacement — declared backends keep appearing under their own names so clients can also address a specific model directly via the passthrough rules.
+
+### Securing aliases
+
+An alias is subject to rules exactly like a model name. A request for `model: <alias>` is evaluated against `spec.rules` first — by classification, header, required capability, or a `match.models` entry that names the alias or a glob covering it — and the alias only resolves when no rule matched. So a fail-closed sensitive-data rule guards aliases the same way it guards models: when it matches, it routes to its own (validated local-tier) backends and the alias never resolves, so the alias's cloud fallback never serves the request.
+
+The guard only covers the aliases the rule actually matches, and this is the operator's responsibility. A classification-only rule — `match: {dataClassification: [pii]}` — matches every `pii` request regardless of the model named, so it covers every alias (and every model) automatically. A model-scoped rule — `match: {dataClassification: [pii], models: [qwen-*]}` — covers only the names it enumerates or globs; a `pii` request naming an alias (or model) outside that set falls through to that alias's backends, which may include cloud. **Keep sensitive-data rules classification-scoped, or enumerate every model and alias they must protect.** Aliases are no more of an egress path than a direct model name — the same rule discipline secures both.
+
 ## What's in scope, what isn't
 
 **In scope:**

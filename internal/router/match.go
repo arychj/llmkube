@@ -56,6 +56,11 @@ type MatchResult struct {
 	// FailClosed is true when a matched fail-closed rule rejects the
 	// request rather than falling through if no backend is healthy.
 	FailClosed bool
+
+	// IsAlias is true when the match came from an alias rather than a
+	// declared rule. Rule and Backends carry the synthetic alias rule;
+	// this flag lets audit distinguish the two routing paths.
+	IsAlias bool
 }
 
 // Matcher pre-computes lookups over a Config so the per-request hot path
@@ -63,6 +68,10 @@ type MatchResult struct {
 type Matcher struct {
 	cfg            *Config
 	backendsByName map[string]*Backend
+
+	// aliasByName maps an exact request model name to the synthetic rule
+	// compiled from the matching alias.
+	aliasByName map[string]*Rule
 }
 
 // NewMatcher returns a Matcher bound to the given config. The matcher
@@ -73,7 +82,19 @@ func NewMatcher(cfg *Config) *Matcher {
 	for i := range cfg.Backends {
 		byName[cfg.Backends[i].Name] = &cfg.Backends[i]
 	}
-	return &Matcher{cfg: cfg, backendsByName: byName}
+	// Compile each alias to a primary-fallback rule so a match reuses the
+	// rule dispatch / timeout / audit path with no special-casing.
+	aliasByName := make(map[string]*Rule, len(cfg.Aliases))
+	for i := range cfg.Aliases {
+		a := &cfg.Aliases[i]
+		aliasByName[a.Name] = &Rule{
+			Name:    a.Name,
+			Match:   RuleMatch{Models: []string{a.Name}},
+			Route:   RuleRoute{Backends: a.Backends, Strategy: strategyPrimaryFallback},
+			Timeout: a.Timeout,
+		}
+	}
+	return &Matcher{cfg: cfg, backendsByName: byName, aliasByName: aliasByName}
 }
 
 // Match evaluates the rule set against the request features and returns
@@ -91,6 +112,19 @@ func (m *Matcher) Match(features *RequestFeatures) MatchResult {
 			Backends:   rule.Route.Backends,
 			Strategy:   strategyOrDefault(rule.Route.Strategy),
 			FailClosed: rule.FailClosed,
+		}
+	}
+
+	// Aliases are exact-name routes, consulted only after every rule has
+	// declined (rules-first is the security invariant).
+	if features.Model != "" {
+		if ar, ok := m.aliasByName[features.Model]; ok {
+			return MatchResult{
+				Rule:     ar,
+				Backends: ar.Route.Backends,
+				Strategy: strategyPrimaryFallback,
+				IsAlias:  true,
+			}
 		}
 	}
 
